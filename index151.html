@@ -1,0 +1,720 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebGPU Cloth PBD</title>
+    <style>
+        /* Сброс стилей и базовые настройки */
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { background: #050510; color: #fff; font-family: monospace; overflow: hidden; }
+        canvas { display: block; width: 100%; height: 100%; }
+
+        /* Панель управления (UI) */
+        #ui {
+            position: absolute; top: 20px; right: 20px;
+            background: rgba(10, 20, 40, 0.9);
+            padding: 20px; border-radius: 8px;
+            border: 1px solid rgba(100, 200, 255, 0.2);
+            min-width: 280px; display: none; /* Скрыто до загрузки */
+            backdrop-filter: blur(5px);
+        }
+        .control { margin-bottom: 12px; }
+        label { display: flex; justify-content: space-between; margin-bottom: 5px; font-size: 13px; color: #add; }
+        input[type="range"] { width: 100%; cursor: pointer; accent-color: #00d2ff; }
+        
+        button {
+            width: 100%; padding: 10px; margin-top: 5px;
+            background: #204060; color: white; border: 1px solid #4080a0;
+            cursor: pointer; border-radius: 4px; font-family: monospace;
+        }
+        button:hover { background: #306080; }
+
+        /* Индикаторы загрузки и ошибок */
+        #loading {
+            position: absolute; top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            font-size: 20px; color: #00d2ff;
+        }
+        #error {
+            position: absolute; top: 10px; left: 10px;
+            color: #ff5555; background: rgba(0,0,0,0.8); padding: 20px;
+            display: none; z-index: 999;
+        }
+    </style>
+</head>
+<body>
+    <div id="loading">Инициализация WebGPU...</div>
+    <div id="error"></div>
+    <canvas id="canvas"></canvas>
+
+    <!-- UI Панель -->
+    <div id="ui">
+        <div class="control"><label>FPS: <span id="fps">0</span></label></div>
+        <div class="control"><label>Sim Time (ms): <span id="simTime">0</span></label></div>
+        
+        <div class="control"><label>Гравитация: <span id="valGravity">0.0</span></label><input type="range" id="gravity" min="0" max="20" step="0.1" value="0.0"></div>
+        <div class="control"><label>Ветер: <span id="valWind">0.0</span></label><input type="range" id="wind" min="0" max="10" step="0.1" value="0.0"></div>
+        
+        <div class="control"><label>Жесткость: <span id="valStiff">50.0</span></label><input type="range" id="stiffness" min="0.1" max="100.0" step="0.1" value="50.0"></div>
+        <div class="control"><label>Демпфирование: <span id="valDamp">1.0</span></label><input type="range" id="damping" min="0.3" max="1.0" step="0.1" value="1.0"></div>
+        <div class="control"><label>Подшаги (Substeps): <span id="valSubsteps">10</span></label><input type="range" id="substeps" min="1" max="50" step="1" value="10"></div>
+        
+        <div class="control"><label>Поворот камеры: <span id="valCam">0</span></label><input type="range" id="camera" min="0" max="360" step="1" value="0"></div>
+
+        <button id="btnPause">Пауза</button>
+        <button id="btnReset">Сброс</button>
+
+        <div style="margin-top:15px; border-top: 1px solid #446; padding-top: 10px;">
+            <label><input type="checkbox" id="chkLines" checked> Сетка</label>
+            <label><input type="checkbox" id="chkDiag1" checked> Диагональ 1 (\)</label>
+            <label><input type="checkbox" id="chkDiag2"> Диагональ 2 (/)</label>
+            <label><input type="checkbox" id="chkPoints" checked> Точки</label>
+        </div>
+    </div>
+
+    <script type="module">
+        // --- КОНФИГУРАЦИЯ СИМУЛЯЦИИ ---
+        const GRID_W = 80;  // Ширина сетки (кол-во узлов)
+        const GRID_H = 60;  // Высота сетки
+        const REST_LEN = 0.10; // Длина квадрата в покое
+        const WORKGROUP_SIZE = 64; // Размер рабочей группы GPU (оптимизация)
+
+        // Индекс центральной точки для генерации волн
+        const CENTER_IDX = Math.floor(GRID_H / 2) * GRID_W + Math.floor(GRID_W / 2);
+
+        // --- WGSL ШЕЙДЕРЫ ---
+        // Весь код, который выполняется на видеокарте
+        const SHADER_CODE = `
+        // Структура параметров, передаваемых из JavaScript (Uniform Buffer)
+        struct SimParams {
+            gridWidth: f32, 
+            gridHeight: f32, 
+            time: f32, 
+            dt: f32, // dt - это дельта времени на ОДИН подшаг
+            gravity: f32, 
+            wind: f32, 
+            stiffness: f32, 
+            damping: f32,
+            centerIdx: f32, 
+            padding: vec3<f32>, // padding для выравнивания памяти (16 байт)
+        };
+
+        struct CameraParams { angleY: f32, padding: vec3<f32> };
+        
+        // Структура пружины (хранится в Storage Buffer)
+        struct Spring { 
+            idxA: u32, // Индекс первого узла
+            idxB: u32, // Индекс второго узла
+            restLen: f32, // Длина покоя
+            typePadding: f32 
+        };
+
+        // Привязки ресурсов (Bind Group 0)
+        @group(0) @binding(0) var<storage, read_write> positions : array<vec4<f32>>; // Позиции (x, y, z, w)
+        @group(0) @binding(1) var<storage, read_write> positionsPrev : array<vec4<f32>>; // Позиции пред (x, y, z, w) //Скорости veloc
+        @group(0) @binding(2) var<storage, read> invMasses : array<vec4<f32>>; // Обратные массы (1/m) можно уменьшить в 4 раза
+        @group(0) @binding(3) var<storage, read> springs : array<Spring>; // Массив пружин
+        @group(0) @binding(4) var<storage, read> springs2 : array<Spring>; // Массив пружин 2
+        @group(0) @binding(5) var<storage, read_write> forces : array<atomic<i32>>; // Накопитель сил (Atomic Int)
+        @group(0) @binding(6) var<uniform> simParams : SimParams; // Параметры
+
+        @group(1) @binding(0) var<uniform> cameraParams : CameraParams; // Камера
+
+        // Множитель для перевода float -> int (для атомарных операций)
+        const FORCE_SCALAR: f32 = 10000.0;
+            
+        // --- 1. COMPUTE SHADER: Расчет воздействия коллизий ---
+        // Запускается один поток на одну пружину
+        //Коллизии растяжения
+        @compute @workgroup_size(${WORKGROUP_SIZE})
+        fn computeCollisions(@builtin(global_invocation_id) id: vec3<u32>) {
+            let idx = id.x;
+            if (idx >= arrayLength(&springs)) { return; } // Выход за границы массива
+
+            let s = springs[idx];
+            let idxA = s.idxA;
+            let idxB = s.idxB;
+
+            let posA = positions[idxA].xyz;
+            let posB = positions[idxB].xyz;
+            
+            let delta = posB - posA;
+            let dist = length(delta);
+
+            if (dist < s.restLen) { return; } // Растяжения нет
+            if (dist < 0.0001) { return; } // Защита от деления на ноль
+
+            let dir = delta / dist; // Нормализованный вектор направления
+            //let velA = velocities[idxA].xyz;
+            //let velB = velocities[idxB].xyz;
+
+            // Закон Гука: F_s = k * (L_текущая - L_покоя)
+            // 500.0 - коэффициент для масштабирования жесткости
+            //let springForceMag = simParams.stiffness * 50.0 * (dist - s.restLen);
+
+            //Huber:d=1
+            //let k=(dist - s.restLen)/s.restLen;
+            //const sigma=0.2;
+            //let kk=select(k*k/2,sigma*k-sigma*sigma/2,k>sigma);
+            //let springForceMag = simParams.stiffness * 50.0 * kk;
+
+            let k=max((dist - s.restLen)/s.restLen+1, (dist - s.restLen*1.01)/s.restLen*40);
+            let springForceMag = min(simParams.stiffness/1 * k,10000);
+
+            let totalForceMag = springForceMag;
+
+            // --- ЛОГИКА ЖЕСТКИХ СВЯЗЕЙ ---
+            // Проверяем, является ли один из концов "гвоздем" (invMass=0) или центром (источник волн)
+            let isFixedA = invMasses[idxA].x == 0.0;
+            let isFixedB = invMasses[idxB].x == 0.0;
+            //let isCenterA = f32(idxA) == simParams.centerIdx;
+            //let isCenterB = f32(idxB) == simParams.centerIdx;
+
+            // Оптимизация без ветвлений (select быстрее if):
+            // Если связь специальная -> коэф 1.0 (полная сила), иначе 0.5 (распределение силы)
+            //let coef = select(0.5, 1.0, isFixedA || isFixedB || isCenterA || isCenterB);
+            //let coef = select(1.0, 2.0, isFixedA || isFixedB || isCenterA || isCenterB);
+            let coef = select(1.0, 2.0, isFixedA || isFixedB);
+            
+            // Умножаем на 2.0 для нормировки (либо 1.0 итоговая, либо 2.0 усиленная)
+            //let forceVec = dir * totalForceMag * (coef * 2.0);
+            let forceVec = dir * totalForceMag * coef;
+
+            // Перевод в int32 для атомарного сложения (Thread Safe Accumulation)
+            let fIntX = i32(forceVec.x * FORCE_SCALAR);
+            let fIntY = i32(forceVec.y * FORCE_SCALAR);
+            let fIntZ = i32(forceVec.z * FORCE_SCALAR);
+
+            // Атомарно добавляем силу узлу A и вычитаем у B (3-й закон Ньютона)
+            atomicAdd(&forces[idxA * 4u + 0u], fIntX);
+            atomicAdd(&forces[idxA * 4u + 1u], fIntY);
+            atomicAdd(&forces[idxA * 4u + 2u], fIntZ);
+
+            atomicSub(&forces[idxB * 4u + 0u], fIntX);
+            atomicSub(&forces[idxB * 4u + 1u], fIntY);
+            atomicSub(&forces[idxB * 4u + 2u], fIntZ);
+        }
+        //Коллизии изгиба
+        @compute @workgroup_size(${WORKGROUP_SIZE})
+        fn computeCollisions2(@builtin(global_invocation_id) id: vec3<u32>) {
+            let idx = id.x;
+            if (idx >= arrayLength(&springs2)) { return; } // Выход за границы массива
+
+            let s = springs2[idx];
+            let idxA = s.idxA;
+            let idxB = s.idxB;
+
+            let posA = positions[idxA].xyz;
+            let posB = positions[idxB].xyz;
+            
+            let delta = posB - posA;
+            let dist = length(delta);
+
+            if (dist > s.restLen) { return; } // изгиба нет
+            if (dist < 0.0001) { return; } // Защита от деления на ноль
+
+            let dir = delta / dist; // Нормализованный вектор направления
+            //let velA = velocities[idxA].xyz;
+            //let velB = velocities[idxB].xyz;
+
+            // Закон Гука: F_s = k * (L_текущая - L_покоя)
+            // 500.0 - магический коэффициент для масштабирования жесткости
+            let springForceMag = simParams.stiffness * 500.0 * (dist - s.restLen);
+
+            //let totalForceMag = springForceMag + dampingForceMag;
+            let totalForceMag = springForceMag;
+
+            // --- ЛОГИКА ЖЕСТКИХ СВЯЗЕЙ ---
+            // Проверяем, является ли один из концов "гвоздем" (invMass=0) или центром (источник волн)
+            let isFixedA = invMasses[idxA].x == 0.0;
+            let isFixedB = invMasses[idxB].x == 0.0;
+
+            // Оптимизация без ветвлений (select быстрее if):
+            // Если связь специальная -> коэф 1.0 (полная сила), иначе 0.5 (распределение силы)
+            let coef = select(1.0, 2.0, isFixedA || isFixedB);
+            
+            // Умножаем на 2.0 для нормировки (либо 1.0 итоговая, либо 2.0 усиленная)
+            let forceVec = dir * totalForceMag * coef;
+
+            // Перевод в int32 для атомарного сложения (Thread Safe Accumulation)
+            let fIntX = i32(forceVec.x * FORCE_SCALAR);
+            let fIntY = i32(forceVec.y * FORCE_SCALAR);
+            let fIntZ = i32(forceVec.z * FORCE_SCALAR);
+
+            // Атомарно добавляем силу узлу A и вычитаем у B (3-й закон Ньютона)
+            atomicAdd(&forces[idxA * 4u + 0u], fIntX);
+            atomicAdd(&forces[idxA * 4u + 1u], fIntY);
+            atomicAdd(&forces[idxA * 4u + 2u], fIntZ);
+
+            atomicSub(&forces[idxB * 4u + 0u], fIntX);
+            atomicSub(&forces[idxB * 4u + 1u], fIntY);
+            atomicSub(&forces[idxB * 4u + 2u], fIntZ);
+        }
+
+        // --- 2. COMPUTE SHADER: ИНТЕГРАЦИЯ Воздействия коллизий ---
+        // Запускается один поток на один узел (вершину)
+        @compute @workgroup_size(${WORKGROUP_SIZE})
+        fn integrateCollisions(@builtin(global_invocation_id) id: vec3<u32>) {
+            let idx = id.x;
+            if (idx >= u32(simParams.gridWidth * simParams.gridHeight)) { return; }
+
+            // Если масса бесконечна (гвоздь), пропускаем интеграцию
+            if (invMasses[idx].x == 0.0) { return; }
+
+            // Читаем накопленные силы и сразу сбрасываем их в 0 для следующего кадра
+            let fx = f32(atomicExchange(&forces[idx * 4u + 0u], 0)) / FORCE_SCALAR;
+            let fy = f32(atomicExchange(&forces[idx * 4u + 1u], 0)) / FORCE_SCALAR;
+            let fz = f32(atomicExchange(&forces[idx * 4u + 2u], 0)) / FORCE_SCALAR;
+
+            var force = vec3<f32>(fx, fy, fz);
+            //var pos = positions[idx].xyz + force * simParams.dt;
+            var pos = positions[idx].xyz + force/500 * simParams.dt;
+            //var pos = positions[idx].xyz + force/10000;
+            //var pos = positions[idx].xyz;
+
+            // Записываем результат
+            positions[idx] = vec4<f32>(pos, 1.0);
+        }
+
+        // --- 0. COMPUTE SHADER: ИНТЕГРАЦИЯ ДВИЖЕНИЯ ---
+        // Запускается один поток на один узел (вершину)
+        @compute @workgroup_size(${WORKGROUP_SIZE})
+        fn integrateNodes(@builtin(global_invocation_id) id: vec3<u32>) {
+            let idx = id.x;
+            if (idx >= u32(simParams.gridWidth * simParams.gridHeight)) { return; }
+
+            // Читаем накопленные силы и сразу сбрасываем их в 0 для следующего кадра
+            //let fx = f32(atomicExchange(&forces[idx * 4u + 0u], 0)) / FORCE_SCALAR;
+            //let fy = f32(atomicExchange(&forces[idx * 4u + 1u], 0)) / FORCE_SCALAR;
+            //let fz = f32(atomicExchange(&forces[idx * 4u + 2u], 0)) / FORCE_SCALAR;
+
+            // Особая логика для центральной точки (Генератор волн)
+            if (idx == u32(simParams.centerIdx)) {
+                // Двигаем по синусоиде вверх-вниз
+                positions[idx].y = sin(simParams.time * 5.0) * 0.5; 
+                //velocities[idx] = vec4<f32>(0.0); // Скорость обнуляем, чтобы не улетала
+                positionsPrev[idx].y = positions[idx].y;
+                return;
+            }
+
+            // Если масса бесконечна (гвоздь), пропускаем интеграцию
+            //let invMass = invMasses[idx].x;
+            //if (invMass == 0.0) { return; }
+            if (invMasses[idx].x == 0.0) { return; }
+
+            //var force = vec3<f32>(fx, fy - simParams.gravity, fz); // Добавляем гравитацию
+            var force = vec3<f32>(0, 0 - simParams.gravity, 0); // Добавляем гравитацию
+
+            // Простой симулятор ветра
+            let windDir = vec3<f32>(sin(simParams.time * 0.5), 0.1, cos(simParams.time * 0.7));
+            force += normalize(windDir) * simParams.wind;
+
+            // Метод Эйлера (Semi-implicit Euler)
+            //var vel = velocities[idx].xyz;
+            //var vel = positions[idx].xyz-positionsPrev[idx].xyz;
+
+            //vel += (force * invMass) * simParams.dt; // v = v + a*dt
+            //vel *= 0.999; // Сопротивление воздуха (глобальное затухание)
+            //pos += vel * simParams.dt; // x = x + v*dt
+            //var pos = positionsPrev[idx].xyz+(force * invMass) * simParams.dt;
+            //var pos = 2*positions[idx].xyz-positionsPrev[idx].xyz+force * simParams.dt;
+            var pos = positions[idx].xyz+(positions[idx].xyz-positionsPrev[idx].xyz)*simParams.damping + force/100 * simParams.dt;
+            //var pos = positions[idx].xyz+(positions[idx].xyz-positionsPrev[idx].xyz)*0.5+force * simParams.dt * simParams.dt;
+
+            // Записываем результат
+            //positions[idx] = vec4<f32>(pos, 1.0);
+            //velocities[idx] = vec4<f32>(vel, 0.0);
+            positionsPrev[idx] = positions[idx];
+            positions[idx] = vec4<f32>(pos, 1.0);
+        }
+
+        // --- 3. VERTEX SHADER: ОТРИСОВКА ---
+        struct VertexOut { @builtin(position) pos : vec4<f32>, @location(0) color : vec4<f32> };
+
+        @vertex
+        fn vsMain(@location(0) pos : vec4<f32>) -> VertexOut {
+            var out : VertexOut;
+            // Вращение камеры
+            let angle = cameraParams.angleY * 0.017453; // Градусы в радианы
+            let c = cos(angle); let s = sin(angle);
+            
+            // Вращение в плоскости XZ
+            let x = pos.x * c - pos.z * s;
+            let z = pos.x * s + pos.z * c;
+            let y = pos.y;
+
+            // Изометрическая проекция
+            let scale = 0.25;
+            let isoX = (x - z) * 0.707 * scale;
+            let isoY = (y + (x + z) * 0.5) * scale;
+            
+            out.pos = vec4<f32>(isoX, isoY, 0.5, 1.0);
+
+            // Раскраска по высоте
+            let h = y * 0.5; 
+            let normalCol = vec4<f32>(0.2 + h*0.2, 0.4 + h*0.3, 0.8 - h*0.1, 0.8);
+            let centerCol = vec4<f32>(0.0, 0.5, 1.0, 1.0); // Синий цвет для центра
+            
+            // Определяем, является ли вершина центром (по координатам)
+            let distCenter = max(abs(pos.x), abs(pos.z));
+            let isNotCenter = step(0.01, distCenter);
+            out.color = mix(centerCol, normalCol, isNotCenter);
+            return out;
+        }
+
+        @fragment fn fsMain(@location(0) color: vec4<f32>) -> @location(0) vec4<f32> { return color; }
+        @fragment fn fsLine() -> @location(0) vec4<f32> { return vec4<f32>(0.8, 0.9, 1.0, 0.15); } // Полупрозрачные линии
+        `;
+
+        class ClothSim {
+            constructor() {
+                this.width = GRID_W;
+                this.height = GRID_H;
+                // Начальные параметры
+                this.params = { 
+                    gravity: 0.0, 
+                    wind: 0.0, 
+                    stiffness: 50.0, 
+                    damping: 1.0, 
+                    cameraAngle: 0, 
+                    paused: false, 
+                    dt: 0.005,
+                    substeps: 10 // Кол-во подшагов по умолчанию
+                };
+                this.device = null;
+                this.fc = 0; 
+                this.lt = 0;
+                // Кэшированные массивы (для оптимизации GC)
+                this.simParamsArray = new Float32Array(20);
+                this.camParamsArray = new Float32Array(16);
+            }
+
+            // --- Инициализация WebGPU ---
+            async init() {
+                try {
+                    if (!navigator.gpu) throw new Error("Ваш браузер не поддерживает WebGPU");
+                    const adapter = await navigator.gpu.requestAdapter();
+                    this.device = await adapter.requestDevice();
+                    this.canvas = document.getElementById('canvas');
+                    this.context = this.canvas.getContext('webgpu');
+                    
+                    const dpr = window.devicePixelRatio || 1;
+                    this.canvas.width = window.innerWidth * dpr;
+                    this.canvas.height = window.innerHeight * dpr;
+                    this.format = navigator.gpu.getPreferredCanvasFormat();
+                    this.context.configure({ device: this.device, format: this.format });
+
+                    this.initBuffers();     // Создание данных
+                    this.createPipelines(); // Создание шейдеров
+                    this.setupUI();         // Настройка интерфейса
+                    
+                    document.getElementById('loading').style.display = 'none';
+                    document.getElementById('ui').style.display = 'block';
+                    this.animate();
+                } catch (e) {
+                    document.getElementById('error').innerText = e.message;
+                    document.getElementById('error').style.display = 'block';
+                    console.error(e);
+                }
+            }
+
+            // --- Создание буферов данных (CPU -> GPU) ---
+            initBuffers() {
+
+                const numNodes = this.width * this.height;
+                const pos = new Float32Array(numNodes * 4);
+                const mass = new Float32Array(numNodes * 4);
+                
+                const sIdxA = [], sIdxB = [], sRest = [], indStruct = [], indDiag1 = [], indDiag2 = []; //на растяжение
+                const sIdxA2 = [], sIdxB2 = [], sRest2 = []; //на сжатие 
+
+                for (let y = 0; y < this.height; y++) {
+                    for (let x = 0; x < this.width; x++) {
+                        const i = y * this.width + x;
+                        // Начальная позиция плоская (y=0)
+                        pos[i*4+0] = (x - this.width/2) * REST_LEN;
+                        pos[i*4+1] = 0.0;
+                        pos[i*4+2] = (y - this.height/2) * REST_LEN;
+                        pos[i*4+3] = 1;
+
+                        // Фиксируем только углы (масса 0 = бесконечность)
+                        //const isCorner = (x==0 || x==this.width-1) && (y==0 || y==this.height-1);
+                        //mass[i*4] = isCorner ? 0 : 1; 
+                        mass[i*4] = 1
+
+                        // Функция добавления пружины
+                        const addSpring = (n, r, list) => {
+                            sIdxA.push(i); 
+                            sIdxB.push(n); 
+                            sRest.push(r);
+                            if (list) list.push(i, n); // Для отрисовки
+                        };
+                        const addSpring2 = (n, r) => {
+                            sIdxA2.push(i); 
+                            sIdxB2.push(n); 
+                            sRest2.push(r);
+                        };
+
+                        // Структурные пружины (вправо и вниз)
+                        if (x < this.width - 1) addSpring(i + 1, REST_LEN, indStruct);
+                        if (y < this.height - 1) addSpring(i + this.width, REST_LEN, indStruct);
+                        // Диагональные пружины (shear) - длина * sqrt(2)
+                        if (x < this.width - 1 && y < this.height - 1) addSpring(i + this.width + 1, REST_LEN * 1.414, indDiag1);
+                        if (x > 0 && y < this.height - 1) addSpring(i + this.width - 1, REST_LEN * 1.414, indDiag2);
+
+                        // Структурные пружины 2 (вправо и вниз)
+                        if (x < this.width - 2) addSpring2(i + 2, REST_LEN*2);
+                        if (y < this.height - 2) addSpring2(i + this.width*2, REST_LEN*2);
+                        // Диагональные пружины (shear) - длина * sqrt(2)
+                        if (x < this.width - 2 && y < this.height - 2) addSpring2(i + 2*this.width + 2, REST_LEN * 1.414 * 2);
+                        if (x > 1 && y < this.height - 2) addSpring2(i + 2*this.width - 2, REST_LEN * 1.414 * 2);
+
+                    }
+                }
+                // углам и центру антимасса = 0 (масса = бесконечность)
+                mass[4*0] = 0; 
+                mass[4*(this.width - 1)] = 0; 
+                mass[4*((this.height-1) * this.width)] = 0; 
+                mass[4*(this.height * this.width - 1)] = 0; 
+                mass[4*CENTER_IDX] = 0; 
+
+                // Упаковка пружин в бинарный буфер
+                this.numSprings = sIdxA.length;
+                const springAB = new ArrayBuffer(this.numSprings * 16);
+                const sDV = new DataView(springAB);
+                for(let k=0; k<this.numSprings; k++) {
+                    const off = k * 16;
+                    sDV.setUint32(off, sIdxA[k], true);
+                    sDV.setUint32(off+4, sIdxB[k], true);
+                    sDV.setFloat32(off+8, sRest[k], true);
+                }
+                this.numSprings2 = sIdxA2.length;
+                const springAB2 = new ArrayBuffer(this.numSprings2 * 16);
+                const sDV2 = new DataView(springAB2);
+                for(let k=0; k<this.numSprings2; k++) {
+                    const off = k * 16;
+                    sDV2.setUint32(off, sIdxA2[k], true);
+                    sDV2.setUint32(off+4, sIdxB2[k], true);
+                    sDV2.setFloat32(off+8, sRest2[k], true);
+                }
+
+                // Хелпер для создания GPU буферов
+                const createBuf = (arr, usage) => {
+                    const b = this.device.createBuffer({ size: arr.byteLength, usage, mappedAtCreation: true });
+                    const dst = arr instanceof ArrayBuffer ? new Uint8Array(b.getMappedRange()) : new Float32Array(b.getMappedRange());
+                    dst.set(arr instanceof ArrayBuffer ? new Uint8Array(arr) : arr);
+                    b.unmap();
+                    return b;
+                };
+
+                // Создаем буферы на GPU
+                this.posBuf = createBuf(pos, GPUBufferUsage.STORAGE | GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST);
+                //this.velBuf = this.device.createBuffer({ size: pos.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+                this.posPrevBuf = createBuf(pos, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
+                this.massBuf = createBuf(mass, GPUBufferUsage.STORAGE);
+                this.springBuf = createBuf(springAB, GPUBufferUsage.STORAGE);
+                this.springBuf2 = createBuf(springAB2, GPUBufferUsage.STORAGE);
+                // Буфер для атомарных сил (размер int32)
+                this.forceBuf = this.device.createBuffer({ size: numNodes * 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
+
+                // Индексные буферы для отрисовки линий
+                const createIndexBuf = (arr) => {
+                    const b = this.device.createBuffer({ size: arr.length*4, usage: GPUBufferUsage.INDEX, mappedAtCreation: true });
+                    new Uint32Array(b.getMappedRange()).set(arr);
+                    b.unmap();
+                    return b;
+                };
+
+                this.indBufStruct = createIndexBuf(indStruct); this.countStruct = indStruct.length;
+                this.indBufDiag1 = createIndexBuf(indDiag1); this.countDiag1 = indDiag1.length;
+                this.indBufDiag2 = createIndexBuf(indDiag2); this.countDiag2 = indDiag2.length;
+
+                // Униформ буферы (параметры)
+                this.simParamsBuf = this.device.createBuffer({ size: 80, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+                this.camParamsBuf = this.device.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+            }
+
+            // --- Создание Пайплайнов (Шейдеров) ---
+            createPipelines() {
+                const module = this.device.createShaderModule({ code: SHADER_CODE });
+                
+                // Описание Bind Group (связь буферов с шейдером)
+                const bgLayout = this.device.createBindGroupLayout({
+                    entries: [
+                        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },           // pos
+                        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },           // vel
+                        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // mass
+                        { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // springs
+                        { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // springs2
+                        { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },           // forces
+                        { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } }            // params
+                    ]
+                });
+
+                const pLayout = this.device.createPipelineLayout({ bindGroupLayouts: [bgLayout] });
+                
+                // вычислительных пайплайна
+                //this.springPipe = this.device.createComputePipeline({ layout: pLayout, compute: { module, entryPoint: "computeSprings" } });
+                this.nodePipe = this.device.createComputePipeline({ layout: pLayout, compute: { module, entryPoint: "integrateNodes" } });
+                this.computeCollisionsPipe = this.device.createComputePipeline({ layout: pLayout, compute: { module, entryPoint: "computeCollisions" } });
+                this.computeCollisions2Pipe = this.device.createComputePipeline({ layout: pLayout, compute: { module, entryPoint: "computeCollisions2" } });
+                this.integrateCollisionsPipe = this.device.createComputePipeline({ layout: pLayout, compute: { module, entryPoint: "integrateCollisions" } });
+
+                // Создание Bind Group
+                this.simBindGroup = this.device.createBindGroup({
+                    layout: bgLayout,
+                    entries: [
+                        { binding: 0, resource: { buffer: this.posBuf } },
+                        { binding: 1, resource: { buffer: this.posPrevBuf } },
+                        { binding: 2, resource: { buffer: this.massBuf } },
+                        { binding: 3, resource: { buffer: this.springBuf } },
+                        { binding: 4, resource: { buffer: this.springBuf2 } },
+                        { binding: 5, resource: { buffer: this.forceBuf } },
+                        { binding: 6, resource: { buffer: this.simParamsBuf } }
+                    ]
+                });
+
+                // Пайплайн для отрисовки (Render Pipeline)
+                const rLayout = {
+                    layout: 'auto',
+                    vertex: { module, entryPoint: "vsMain", buffers: [{ arrayStride: 16, attributes: [{ shaderLocation: 0, format: "float32x4", offset: 0 }] }] },
+                    fragment: { module, entryPoint: "fsMain", targets: [{ format: this.format, blend: { color: { srcFactor:'src-alpha', dstFactor:'one-minus-src-alpha'}, alpha: {srcFactor:'one', dstFactor:'one'} } }] },
+                    primitive: { topology: "point-list" }
+                };
+                this.pointPipe = this.device.createRenderPipeline(rLayout);
+                this.rendBindPoints = this.device.createBindGroup({ layout: this.pointPipe.getBindGroupLayout(1), entries: [{ binding: 0, resource: { buffer: this.camParamsBuf } }] });
+
+                const lineLayout = { ...rLayout, fragment: { ...rLayout.fragment, entryPoint: "fsLine" }, primitive: { topology: "line-list" } };
+                this.linePipe = this.device.createRenderPipeline(lineLayout);
+                this.rendBindLines = this.device.createBindGroup({ layout: this.linePipe.getBindGroupLayout(1), entries: [{ binding: 0, resource: { buffer: this.camParamsBuf } }] });
+            }
+
+            // --- Обновление параметров на GPU ---
+            updateParams() {
+                const s = this.simParamsArray;
+                s[0] = this.width; 
+                s[1] = this.height;
+                s[2] = this.params.paused ? 0 : performance.now()/1000;
+                // Важно: dt делим на кол-во подшагов!
+                //s[3] = this.params.dt / this.params.substeps;
+                s[3] = this.params.dt;
+                s[4] = this.params.gravity; 
+                s[5] = this.params.wind;
+                s[6] = this.params.stiffness; 
+                s[7] = this.params.damping;
+                s[8] = CENTER_IDX;
+                this.device.queue.writeBuffer(this.simParamsBuf, 0, s);
+
+                const c = this.camParamsArray;
+                c[0] = this.params.cameraAngle;
+                this.device.queue.writeBuffer(this.camParamsBuf, 0, c);
+            }
+
+            // --- Основной цикл анимации ---
+            animate = () => {
+                const start = performance.now();
+                this.updateParams(); // Отправляем новые параметры на GPU
+                const enc = this.device.createCommandEncoder();
+
+                // 1. Физический проход (Compute Pass)
+                if (!this.params.paused) {
+                    const cp = enc.beginComputePass();
+                    const wgSprings = Math.ceil(this.numSprings / WORKGROUP_SIZE);
+                    const wgSprings2 = Math.ceil(this.numSprings2 / WORKGROUP_SIZE);
+                    const wgNodes = Math.ceil((this.width * this.height) / WORKGROUP_SIZE);
+
+                    // Этап 0: движение без учета коллизий (инерция, гравитация, ветер)
+                    cp.setPipeline(this.nodePipe);
+                    cp.setBindGroup(0, this.simBindGroup);
+                    cp.dispatchWorkgroups(wgNodes);
+                        
+                    // Цикл подшагов (Sub-stepping) для стабильности
+                    for(let i=0; i<this.params.substeps; i++) {
+                        // Этап 1: Расчет воздействия коллизий
+                        cp.setPipeline(this.computeCollisionsPipe);
+                        cp.setBindGroup(0, this.simBindGroup);
+                        cp.dispatchWorkgroups(wgSprings);
+
+                        cp.setPipeline(this.computeCollisions2Pipe);
+                        cp.setBindGroup(0, this.simBindGroup);
+                        cp.dispatchWorkgroups(wgSprings2);
+
+                        // Этап 2: Интеграция воздействия коллизий (движение)
+                        cp.setPipeline(this.integrateCollisionsPipe);
+                        cp.setBindGroup(0, this.simBindGroup);
+                        cp.dispatchWorkgroups(wgNodes);
+
+                        // Этап А: Расчет сил
+                        //cp.setPipeline(this.springPipe);
+                        //cp.setBindGroup(0, this.simBindGroup);
+                        //cp.dispatchWorkgroups(wgSprings);
+
+                        // Этап Б: Интеграция (движение)
+                        //cp.setPipeline(this.nodePipe);
+                        //cp.setBindGroup(0, this.simBindGroup);
+                        //cp.dispatchWorkgroups(wgNodes);
+                    }
+                    cp.end();
+                    
+                }
+
+                // 2. Графический проход (Render Pass)
+                const view = this.context.getCurrentTexture().createView();
+                const rp = enc.beginRenderPass({ colorAttachments: [{ view, clearValue: { r:0.02,g:0.05,b:0.1,a:1 }, loadOp:'clear', storeOp:'store' }] });
+
+                // Отрисовка линий
+                rp.setPipeline(this.linePipe);
+                rp.setBindGroup(1, this.rendBindLines);
+                rp.setVertexBuffer(0, this.posBuf);
+                
+                if (document.getElementById('chkLines').checked) { rp.setIndexBuffer(this.indBufStruct, 'uint32'); rp.drawIndexed(this.countStruct); }
+                if (document.getElementById('chkDiag1').checked) { rp.setIndexBuffer(this.indBufDiag1, 'uint32'); rp.drawIndexed(this.countDiag1); }
+                if (document.getElementById('chkDiag2').checked) { rp.setIndexBuffer(this.indBufDiag2, 'uint32'); rp.drawIndexed(this.countDiag2); }
+
+                // Отрисовка точек
+                if (document.getElementById('chkPoints').checked) {
+                    rp.setPipeline(this.pointPipe);
+                    rp.setBindGroup(1, this.rendBindPoints);
+                    rp.setVertexBuffer(0, this.posBuf);
+                    rp.draw(this.width * this.height);
+                }
+
+                rp.end();
+                this.device.queue.submit([enc.finish()]);
+
+                // Счетчик FPS и Sim Time
+                const end = performance.now();
+                this.fc++;
+                if (end - this.lt > 1000) {
+                    document.getElementById('fps').innerText = this.fc;
+                    document.getElementById('simTime').innerText = (end - start).toFixed(2);
+                    this.fc = 0; 
+                    this.lt = end;
+                }
+                requestAnimationFrame(this.animate);
+            }
+
+            // --- Настройка событий интерфейса ---
+            setupUI() {
+                const on = (id, fn) => document.getElementById(id).oninput = fn;
+                on('gravity', e => { this.params.gravity = +e.target.value; document.getElementById('valGravity').innerText = this.params.gravity.toFixed(1); });
+                on('wind', e => { this.params.wind = +e.target.value; document.getElementById('valWind').innerText = this.params.wind.toFixed(1); });
+                on('stiffness', e => { this.params.stiffness = +e.target.value; document.getElementById('valStiff').innerText = this.params.stiffness.toFixed(1); });
+                on('damping', e => { this.params.damping = +e.target.value; document.getElementById('valDamp').innerText = this.params.damping.toFixed(1); });
+                on('substeps', e => { this.params.substeps = +e.target.value; document.getElementById('valSubsteps').innerText = this.params.substeps; });
+                
+                on('camera', e => { this.params.cameraAngle = +e.target.value; document.getElementById('valCam').innerText = this.params.cameraAngle; });
+                
+                document.getElementById('btnPause').onclick = (e) => {
+                    this.params.paused = !this.params.paused;
+                    e.target.innerText = this.params.paused ? "Старт" : "Пауза";
+                };
+                document.getElementById('btnReset').onclick = () => window.location.reload();
+            }
+        }
+
+        new ClothSim().init();
+    </script>
+</body>
+</html>
